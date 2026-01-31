@@ -91,13 +91,16 @@ const App: React.FC = () => {
   // Likes State (Client-side simulation)
   const [likedIds, setLikedIds] = useState<Set<string>>(new Set());
 
+  // AI Service Reference
   const chatServiceRef = useRef<GameForgeService | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const communityScrollRef = useRef<HTMLDivElement>(null);
+  const sidebarChatRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const init = async () => {
       try {
+        // Initialize Gemini Service
         chatServiceRef.current = new GameForgeService();
         
         const savedTheme = localStorage.getItem('forge_theme') as Theme;
@@ -160,7 +163,8 @@ const App: React.FC = () => {
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [messages, isLoading, activeTab, activeView]);
+    if (sidebarChatRef.current) sidebarChatRef.current.scrollTop = sidebarChatRef.current.scrollHeight;
+  }, [messages, isLoading, activeTab, activeView, globalChat]);
 
   useEffect(() => {
     if (communityScrollRef.current) communityScrollRef.current.scrollTop = communityScrollRef.current.scrollHeight;
@@ -352,7 +356,7 @@ const App: React.FC = () => {
     }, 300);
   };
 
-  const handleSend = async () => {
+  const handleSend = async (retryCount = 0) => {
     if (!input.trim() || isLoading) return;
 
     if (userStats.tier === 'free' && userStats.monthlyUsage >= FREE_TIER_LIMIT) {
@@ -360,26 +364,28 @@ const App: React.FC = () => {
       return;
     }
 
-    const userMsg: Message = { role: 'user', content: input, timestamp: Date.now() };
-    setMessages(prev => [...prev, userMsg]);
     const currentInput = input;
-    setInput('');
+    if (retryCount === 0) {
+      const userMsg: Message = { role: 'user', content: input, timestamp: Date.now() };
+      setMessages(prev => [...prev, userMsg]);
+      setInput('');
+    }
     setIsLoading(true);
 
     try {
       if (chatServiceRef.current) {
         const response = await chatServiceRef.current.sendMessage(currentInput);
         
+        const code = response.code;
+        const cleanText = response.text;
+        
         let cleanTitle = 'New Creation';
-        if (response.code) {
-          // Robust title extraction: Prioritize <h1> content from the generated HTML code
-          // This ensures "Bunny Put" in the game preview is also "Bunny Put" in Explore
-          const h1Match = response.code.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+        if (code) {
+          const h1Match = code.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
           if (h1Match && h1Match[1]) {
             cleanTitle = h1Match[1].replace(/<[^>]*>/g, '').trim();
           } else {
-            // Fallback: First non-empty line from text response
-            const rawTitleLine = response.text.split('\n').find(line => line.trim().length > 0) || 'New Creation';
+            const rawTitleLine = cleanText.split('\n').find(line => line.trim().length > 0) || 'New Creation';
             cleanTitle = rawTitleLine.replace(/[#*`]/g, '').trim();
           }
         }
@@ -388,18 +394,18 @@ const App: React.FC = () => {
 
         const assistantMsg: Message = {
           role: 'assistant',
-          content: response.text,
-          code: response.code || undefined,
+          content: cleanText,
+          code: code || undefined,
           timestamp: Date.now(),
         };
 
-        if (response.code) {
+        if (code) {
           updateUsage();
-          setCurrentCode(response.code);
+          setCurrentCode(code);
           const newGame: SavedGame = {
             id: crypto.randomUUID(),
             title: cleanTitle,
-            code: response.code,
+            code: code,
             timestamp: Date.now(),
             prompt: currentInput,
             version: 1.0,
@@ -409,12 +415,11 @@ const App: React.FC = () => {
           await db.games.add(newGame);
           setSavedGames(prev => [newGame, ...prev]);
 
-          // Automatically share to Explore feed with the EXACT matching title as specified
           const newCommunityGame: CommunityGame = {
             id: 'community_' + newGame.id,
             title: newGame.title, 
             author: currentUser?.username || 'Architect',
-            description: response.text.split('\n').slice(0, 2).join(' ').substring(0, 120) + '...',
+            description: cleanText.split('\n').slice(0, 2).join(' ').substring(0, 120) + '...',
             likes: 0,
             plays: 0,
             code: newGame.code,
@@ -427,9 +432,16 @@ const App: React.FC = () => {
         setMessages(prev => [...prev, assistantMsg]);
       }
     } catch (error: any) {
-      console.error("Forging Error:", error);
+      console.error(`Forging Error (Attempt ${retryCount + 1}):`, error);
       
       const isQuotaError = error.message?.includes('429') || error.message?.includes('quota');
+      if (isQuotaError && retryCount < 3) {
+        const waitTime = Math.pow(2, retryCount) * 2000;
+        console.warn(`Quota exceeded. Retrying in ${waitTime}ms...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+        return handleSend(retryCount + 1);
+      }
+
       const errorMessage: Message = {
         role: 'assistant',
         content: isQuotaError 
@@ -443,30 +455,27 @@ const App: React.FC = () => {
     }
   };
 
-  const handleSendGlobalChat = () => {
+  const handleSendGlobalChat = (inputVal: string, setInputVal: (s: string) => void) => {
     const now = Date.now();
-    const trimmedInput = chatInput.trim();
+    const trimmedInput = inputVal.trim();
     if (!trimmedInput) return;
     if (!currentUser) {
       setIsAuthModalOpen(true);
       return;
     }
 
-    // 1. Base Cooldown (3 seconds)
     if (now - lastMessageTime < 3000) {
       setChatValidationError('Slow down! 3s cooldown active.');
       setTimeout(() => setChatValidationError(''), 2000);
       return;
     }
 
-    // 2. Anti-Duplicate
     if (trimmedInput === lastMessageContent) {
       setChatValidationError('Duplicates are not allowed.');
       setTimeout(() => setChatValidationError(''), 2000);
       return;
     }
 
-    // 3. Flood Limit (5 messages per 15 seconds)
     const recentMessages = messageHistoryTimes.filter(t => now - t < 15000);
     if (recentMessages.length >= 5) {
       setChatValidationError('Flood protection: Limit 5 msgs / 15s.');
@@ -474,7 +483,6 @@ const App: React.FC = () => {
       return;
     }
 
-    // 4. Link Throttle (1 per 30 seconds)
     const linkRegex = /(https?:\/\/|www\.)[^\s]+/gi;
     if (linkRegex.test(trimmedInput)) {
       if (now - lastLinkTime < 30000) {
@@ -485,7 +493,6 @@ const App: React.FC = () => {
       setLastLinkTime(now);
     }
 
-    // Validation passed
     const msg: ChatMessage = {
       id: crypto.randomUUID(),
       username: currentUser.username,
@@ -497,7 +504,7 @@ const App: React.FC = () => {
     };
 
     setGlobalChat(prev => [...prev, msg]);
-    setChatInput('');
+    setInputVal('');
     setLastMessageTime(now);
     setLastMessageContent(trimmedInput);
     setMessageHistoryTimes([...recentMessages, now]);
@@ -536,7 +543,6 @@ const App: React.FC = () => {
     if (confirm("Permanently delete this creation?")) {
       await db.games.delete(id);
       setSavedGames(prev => prev.filter(g => g.id !== id));
-      // Also remove from the synchronized community feed simulation
       setCommunityGames(prev => prev.filter(g => g.id !== 'community_' + id));
     }
   };
@@ -552,12 +558,9 @@ const App: React.FC = () => {
       const updated = { ...editingGame, title: editTitle };
       await db.games.put(updated);
       setSavedGames(prev => prev.map(g => g.id === editingGame.id ? updated : g));
-      
-      // Critical: Ensure Explore feed is updated with the NEW title immediately
       setCommunityGames(prev => prev.map(g => 
         g.id === 'community_' + editingGame.id ? { ...g, title: editTitle } : g
       ));
-      
       setEditingGame(null);
     }
   };
@@ -565,8 +568,6 @@ const App: React.FC = () => {
   const isLimitReached = userStats.tier === 'free' && userStats.monthlyUsage >= FREE_TIER_LIMIT;
   const remainingCredits = Math.max(0, FREE_TIER_LIMIT - userStats.monthlyUsage);
   const creditsDisplay = userStats.tier === 'pro' ? 'Unlimited' : `${remainingCredits}/${FREE_TIER_LIMIT}`;
-
-  // Helper to determine if we are currently "Playing" based on code content
   const isGameLoaded = currentCode !== INITIAL_GAME_HTML;
 
   return (
@@ -651,6 +652,8 @@ const App: React.FC = () => {
           {activeTab === 'forge' && (
             <div className="flex-1 flex flex-col lg:flex-row p-4 md:p-6 gap-6 overflow-hidden max-h-[calc(100vh-120px)]">
               <div className={`flex-1 lg:max-w-md xl:max-w-lg flex flex-col glass rounded-[2rem] overflow-hidden transition-all duration-500 ${activeView === 'play' ? 'hidden lg:flex' : 'flex'}`}>
+                
+                {/* Forge Sidebar Content */}
                 <div className="flex-1 overflow-y-auto p-6 custom-scrollbar" ref={scrollRef}>
                   {messages.map((m, i) => <ChatBubble key={i} message={m} />)}
                   {isLoading && (
@@ -679,12 +682,13 @@ const App: React.FC = () => {
                       disabled={isLoading || isLimitReached}
                       className="w-full bg-[var(--bg-main)] border border-[var(--border-muted)] rounded-2xl px-5 py-4 text-sm focus:ring-2 focus:ring-sky-500/50 resize-none h-20 font-medium text-[var(--text-main)]"
                     />
-                    <button onClick={handleSend} disabled={isLoading || !input.trim() || isLimitReached} className="absolute right-3 bottom-3 p-3 bg-sky-500 hover:bg-sky-400 text-white rounded-xl shadow-lg disabled:opacity-50 transition-all">
+                    <button onClick={() => handleSend()} disabled={isLoading || !input.trim() || isLimitReached} className="absolute right-3 bottom-3 p-3 bg-sky-500 hover:bg-sky-400 text-white rounded-xl shadow-lg disabled:opacity-50 transition-all">
                       <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
                     </button>
                   </div>
                 </div>
               </div>
+
               <div className={`flex-[1.5] relative flex flex-col transition-all duration-500 ${activeView === 'chat' ? 'hidden lg:flex' : 'flex'}`}>
                 <GamePreview code={currentCode} onBack={() => setActiveView('chat')} />
               </div>
@@ -721,18 +725,14 @@ const App: React.FC = () => {
             </div>
           )}
 
-          {/* Connect View: Dynamic Split View */}
+          {/* Connect View */}
           {activeTab === 'connect' && (
             <div className={`flex-1 flex flex-col p-4 md:p-6 gap-6 overflow-hidden max-h-[calc(100vh-120px)] ${isGameLoaded ? 'lg:flex-row' : 'items-center justify-center'}`}>
-              
-              {/* Game View (Conditional) */}
               {isGameLoaded && (
                 <div className="flex-[1.5] relative flex flex-col transition-all duration-500 animate-in fade-in slide-in-from-left-4">
                   <GamePreview code={currentCode} />
                 </div>
               )}
-
-              {/* Chat View (Adjustable size) */}
               <div className={`flex flex-col glass rounded-[2.5rem] overflow-hidden shadow-2xl transition-all duration-500 animate-in fade-in ${isGameLoaded ? 'flex-1 lg:max-w-md xl:max-w-lg' : 'max-w-4xl w-full flex-1'}`}>
                 <div className="h-16 border-b border-[var(--border-muted)] flex items-center px-8 justify-between bg-gray-500/5">
                   <div className="flex items-center gap-3">
@@ -779,11 +779,11 @@ const App: React.FC = () => {
                       type="text"
                       value={chatInput}
                       onChange={(e) => setChatInput(e.target.value)}
-                      onKeyDown={(e) => e.key === 'Enter' && handleSendGlobalChat()}
+                      onKeyDown={(e) => e.key === 'Enter' && handleSendGlobalChat(chatInput, setChatInput)}
                       placeholder={currentUser ? "Broadcast to the forge network..." : "Sign in to chat..."}
                       className="flex-1 bg-[var(--bg-main)] border border-[var(--border-muted)] rounded-2xl px-6 py-3 text-sm focus:ring-2 focus:ring-purple-500/50 transition-all placeholder:text-[var(--text-muted)]/40"
                     />
-                    <button onClick={handleSendGlobalChat} className="p-3 bg-purple-600 hover:bg-purple-500 text-white rounded-2xl transition-all shadow-lg shadow-purple-500/20 active:scale-90">
+                    <button onClick={() => handleSendGlobalChat(chatInput, setChatInput)} className="p-3 bg-purple-600 hover:bg-purple-500 text-white rounded-2xl transition-all shadow-lg shadow-purple-500/20 active:scale-90">
                        <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7" /></svg>
                     </button>
                   </div>
